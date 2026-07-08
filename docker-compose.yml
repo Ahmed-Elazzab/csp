@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: csp_postgres
+    environment:
+      POSTGRES_USER: csp_user
+      POSTGRES_PASSWORD: csp_pass
+      POSTGRES_DB: csp_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - csp_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U csp_user -d csp_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  csp_postgres_data:

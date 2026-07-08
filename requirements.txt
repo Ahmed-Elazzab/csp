@@ -1,0 +1,16 @@
+streamlit>=1.35.0
+sqlalchemy>=2.0.30
+alembic>=1.13.1
+psycopg2-binary>=2.9.9
+pydantic>=2.7.0
+pydantic-settings>=2.2.1
+openai>=1.30.0
+duckduckgo-search>=6.2.0
+openpyxl>=3.1.2
+pandas>=2.2.0
+python-dotenv>=1.0.1
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.0
+pytest>=7.4.4
+pytest-mock>=3.12.0
