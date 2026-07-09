@@ -49,7 +49,7 @@ if submitted:
         reset_session()
         st.session_state.current_part_number = part_number.strip()
 
-        with st.spinner(f"Researching **{part_number}** online — this may take 15-30 seconds..."):
+        with st.spinner(f"Researching **{part_number}** online — this may take 15–30 seconds..."):
             try:
                 agent = ResearchAgent()
                 result = agent.research_part(part_number.strip())
@@ -62,14 +62,23 @@ if submitted:
                 st.session_state.current_part_id = part_id
                 st.session_state.research_result = result
 
-                st.success(
-                    f"✅ Research complete — found {len(result.source_urls)} sources "
-                    f"(confidence: {result.overall_confidence:.0%})"
-                )
-                st.info("➡️ Proceed to **Research Results** to review extracted data.")
+                if result.source_urls:
+                    st.success(
+                        f"✅ Research complete — found {len(result.source_urls)} sources "
+                        f"(confidence: {result.overall_confidence:.0%})"
+                    )
+                else:
+                    st.warning(
+                        "⚠️ Web search returned no results for this part.  \n"
+                        "This is common in WSL / corporate networks where DuckDuckGo is blocked.  \n"
+                        "**You can still proceed** — the questionnaire will ask you for the details manually.  \n\n"
+                        "**To enable reliable search**, add a free SerpAPI key to your `.env`:  \n"
+                        "`SERPAPI_KEY=your_key`  → get one at https://serpapi.com (100 free/month)"
+                    )
+
             except Exception as exc:
                 logger.exception("Research failed")
-                st.error(f"Research failed: {exc}")
+                st.error(f"Research error: {exc}")
 
 # ── Show previously researched part if session is active ──────────────────────
 if "current_part_number" in st.session_state:

@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # Research
     SEARCH_MAX_RESULTS: int = 5
     CONFIDENCE_THRESHOLD: float = 0.70
+    SERPAPI_KEY: str = ""  # optional – more reliable than DDG in restricted networks
 
     # Excel
     EXCEL_PATH: str = "data/Critical Parts Attributes.xlsx"

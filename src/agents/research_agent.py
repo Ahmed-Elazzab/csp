@@ -135,30 +135,156 @@ class ResearchAgent:
         self._populate_result(result, extracted, search_hits)
         return result
 
-    # ── Web search ────────────────────────────────────────────────────────────
+    # ── Web search (multi-strategy with fallbacks) ────────────────────────────
 
     def _web_search(self, part_number: str) -> list[dict]:
-        """Search DuckDuckGo for the part number."""
-        try:
-            from duckduckgo_search import DDGS  # type: ignore
+        """
+        Try three search strategies in order until one returns results:
+          1. DuckDuckGo DDGS library  (most capable, but rate-limited in WSL/cloud)
+          2. DuckDuckGo HTML endpoint (plain HTTP, bypasses JS-based blocking)
+          3. SerpAPI                  (reliable paid/free API – set SERPAPI_KEY in .env)
+        """
+        hits = self._search_duckduckgo_ddgs(part_number)
+        if hits:
+            return hits
 
-            queries = [
+        logger.info("DDGS returned no results – trying HTML fallback")
+        hits = self._search_duckduckgo_html(part_number)
+        if hits:
+            return hits
+
+        if self.settings.SERPAPI_KEY:
+            logger.info("HTML fallback empty – trying SerpAPI")
+            hits = self._search_serpapi(part_number)
+
+        if not hits:
+            logger.warning(
+                "All search strategies returned no results for '%s'. "
+                "Check network connectivity in WSL (try: curl https://html.duckduckgo.com). "
+                "Set SERPAPI_KEY in .env for a reliable alternative.",
+                part_number,
+            )
+        return hits
+
+    def _search_duckduckgo_ddgs(self, part_number: str) -> list[dict]:
+        """DuckDuckGo via the duckduckgo-search library with retry + backoff."""
+        # Try two query forms: quoted (exact) first, then unquoted (broader)
+        query_sets = [
+            [
                 f'"{part_number}" spare part specification',
                 f'"{part_number}" manufacturer datasheet',
-            ]
+            ],
+            [
+                f"{part_number} spare part technical",
+                f"{part_number} manufacturer",
+            ],
+        ]
+        for queries in query_sets:
             hits: list[dict] = []
             seen: set[str] = set()
-            with DDGS() as ddgs:
-                for q in queries:
-                    for r in ddgs.text(q, max_results=self.settings.SEARCH_MAX_RESULTS):
-                        href = r.get("href", "")
-                        if href and href not in seen:
-                            seen.add(href)
-                            hits.append(r)
-                    time.sleep(0.5)
-            return hits[: self.settings.SEARCH_MAX_RESULTS * 2]
+            for attempt in range(3):
+                try:
+                    from duckduckgo_search import DDGS  # type: ignore
+
+                    with DDGS() as ddgs:
+                        for q in queries:
+                            for r in ddgs.text(
+                                q,
+                                max_results=self.settings.SEARCH_MAX_RESULTS,
+                            ):
+                                href = r.get("href", "")
+                                if href and href not in seen:
+                                    seen.add(href)
+                                    hits.append(r)
+                            time.sleep(1.0)
+                    if hits:
+                        logger.info(
+                            "DDGS returned %d hits on attempt %d", len(hits), attempt + 1
+                        )
+                        return hits[: self.settings.SEARCH_MAX_RESULTS * 2]
+                except Exception as exc:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "DDGS attempt %d/%d failed (%s) – retrying in %ds",
+                        attempt + 1, 3, exc, wait,
+                    )
+                    time.sleep(wait)
+        return []
+
+    def _search_duckduckgo_html(self, part_number: str) -> list[dict]:
+        """
+        Parse DuckDuckGo's lightweight HTML endpoint directly.
+        More WSL-friendly: plain HTTP GET, no JS, no Cloudflare challenge.
+        """
+        from urllib.parse import quote_plus
+
+        query = f"{part_number} spare part technical specifications manufacturer"
+        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            hits: list[dict] = []
+            for result in soup.select(".result")[: self.settings.SEARCH_MAX_RESULTS * 2]:
+                link_el = result.select_one(".result__a")
+                snippet_el = result.select_one(".result__snippet")
+                if not link_el:
+                    continue
+                href = link_el.get("href", "")
+                # DDG HTML wraps URLs in a redirect – unwrap if needed
+                if href.startswith("/"):
+                    from urllib.parse import parse_qs, urlparse as _up
+                    qs = parse_qs(_up(href).query)
+                    href = qs.get("uddg", [href])[0]
+                if not href.startswith("http"):
+                    continue
+                hits.append(
+                    {
+                        "title": link_el.get_text(strip=True),
+                        "href": href,
+                        "body": snippet_el.get_text(strip=True) if snippet_el else "",
+                    }
+                )
+            logger.info("DDG HTML fallback returned %d hits", len(hits))
+            return hits
         except Exception as exc:
-            logger.error("DuckDuckGo search failed: %s", exc)
+            logger.warning("DDG HTML fallback failed: %s", exc)
+            return []
+
+    def _search_serpapi(self, part_number: str) -> list[dict]:
+        """Use SerpAPI (Google Search) when DuckDuckGo is unavailable."""
+        try:
+            url = "https://serpapi.com/search"
+            params = {
+                "q": f"{part_number} spare part technical specification manufacturer",
+                "api_key": self.settings.SERPAPI_KEY,
+                "num": self.settings.SEARCH_MAX_RESULTS * 2,
+                "hl": "en",
+            }
+            resp = requests.get(url, params=params, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            hits: list[dict] = []
+            for r in data.get("organic_results", []):
+                hits.append(
+                    {
+                        "title": r.get("title", ""),
+                        "href": r.get("link", ""),
+                        "body": r.get("snippet", ""),
+                    }
+                )
+            logger.info("SerpAPI returned %d hits", len(hits))
+            return hits
+        except Exception as exc:
+            logger.warning("SerpAPI search failed: %s", exc)
             return []
 
     # ── OpenAI extraction ─────────────────────────────────────────────────────
