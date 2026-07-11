@@ -23,7 +23,9 @@ class Settings(BaseSettings):
     # Research
     SEARCH_MAX_RESULTS: int = 5
     CONFIDENCE_THRESHOLD: float = 0.70
-    SERPAPI_KEY: str = ""  # optional – more reliable than DDG in restricted networks
+    TAVILY_API_KEY: str = ""   # recommended – purpose-built for AI search, free tier available
+    SERPAPI_KEY: str = ""      # alternative – reliable in restricted networks
+    SEARCH_TIMEOUT: int = 12   # seconds before giving up on all search strategies
 
     # Excel
     EXCEL_PATH: str = "data/Critical Parts Attributes.xlsx"
