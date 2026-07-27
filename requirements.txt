@@ -1,17 +1,35 @@
+# ── Core framework ─────────────────────────────────────────────────────────────
 streamlit>=1.35.0
+
+# ── Database ────────────────────────────────────────────────────────────────────
 sqlalchemy>=2.0.30
 alembic>=1.13.1
 psycopg2-binary>=2.9.9
+
+# ── Configuration & validation ─────────────────────────────────────────────────
 pydantic>=2.7.0
 pydantic-settings>=2.2.1
-openai>=1.30.0
-tavily-python>=0.3.0
-duckduckgo-search>=6.2.0
-openpyxl>=3.1.2
-pandas>=2.2.0
 python-dotenv>=1.0.1
-requests>=2.31.0
+
+# ── LLM providers ──────────────────────────────────────────────────────────────
+openai>=1.30.0           # covers OpenAI, Azure OpenAI, Ollama, vLLM, LM Studio
+
+# Optional — install only the provider(s) you need:
+# pip install anthropic              # Anthropic Claude
+# pip install google-generativeai    # Google Gemini
+
+# ── Search backends ─────────────────────────────────────────────────────────────
+tavily-python>=0.3.0     # recommended AI-native search
+duckduckgo-search>=6.2.0 # free fallback search
+requests>=2.31.0         # HTML scraping fallback
 beautifulsoup4>=4.12.3
 lxml>=5.2.0
+
+# ── Data & Excel ────────────────────────────────────────────────────────────────
+openpyxl>=3.1.2
+pandas>=2.2.0
+
+# ── Testing ─────────────────────────────────────────────────────────────────────
 pytest>=7.4.4
 pytest-mock>=3.12.0
+

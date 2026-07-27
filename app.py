@@ -46,13 +46,14 @@ if not st.session_state.get("app_initialized"):
         )
         st.stop()
 
-# ── Navigation (no "app" entry – sidebar starts directly at Part Lookup) ───────
+# ── Navigation — 3-page autonomous pipeline ────────────────────────────────────
 pg = st.navigation(
     [
-        st.Page("pages/1_Part_Lookup.py",        title="Part Lookup",       icon="🔍"),
-        st.Page("pages/2_Research_Results.py",   title="Research Results",  icon="📊"),
-        st.Page("pages/3_Questionnaire.py",      title="Questionnaire",     icon="📋"),
-        st.Page("pages/4_Assessment_Result.py",  title="Assessment Result", icon="🎯"),
+        st.Page("pages/1_Part_Lookup.py",       title="Part Lookup",       icon="🔍"),
+        st.Page("pages/2_Assessment_Report.py", title="Assessment Report", icon="📊"),
+        st.Page("pages/3_History.py",           title="History",           icon="📜"),
     ]
 )
 pg.run()
+
+

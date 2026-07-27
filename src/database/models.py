@@ -141,6 +141,8 @@ class Assessment(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     part_id: Mapped[int] = mapped_column(ForeignKey("spare_parts.id"), nullable=False)
+
+    # ── Legacy fields (questionnaire-based scoring) ────────────────────────────
     operations_score: Mapped[float] = mapped_column(Float, default=0.0)
     supply_chain_score: Mapped[float] = mapped_column(Float, default=0.0)
     inventory_score: Mapped[float] = mapped_column(Float, default=0.0)
@@ -148,11 +150,36 @@ class Assessment(Base):
     label: Mapped[str] = mapped_column(String(50), nullable=False)
     override_label: Mapped[Optional[str]] = mapped_column(String(50))
     override_reason: Mapped[Optional[str]] = mapped_column(Text)
-    key_reasons: Mapped[Optional[str]] = mapped_column(Text)            # JSON array
-    override_rules_triggered: Mapped[Optional[str]] = mapped_column(Text)  # JSON array
-    missing_attributes: Mapped[Optional[str]] = mapped_column(Text)     # JSON array
+    key_reasons: Mapped[Optional[str]] = mapped_column(Text)
+    override_rules_triggered: Mapped[Optional[str]] = mapped_column(Text)
+    missing_attributes: Mapped[Optional[str]] = mapped_column(Text)
     confirmed_by_user: Mapped[bool] = mapped_column(Boolean, default=False)
     assessment_version: Mapped[int] = mapped_column(Integer, default=1)
+
+    # ── NWC 4-dimension fields ─────────────────────────────────────────────────
+    # Dimension options (A/B/C/D selected by LLM)
+    nwc_operations_option: Mapped[Optional[str]] = mapped_column(String(5))
+    nwc_operations_score: Mapped[Optional[int]] = mapped_column(Integer)
+    nwc_water_quality_option: Mapped[Optional[str]] = mapped_column(String(5))
+    nwc_water_quality_score: Mapped[Optional[int]] = mapped_column(Integer)
+    nwc_availability_option: Mapped[Optional[str]] = mapped_column(String(5))
+    nwc_availability_score: Mapped[Optional[int]] = mapped_column(Integer)
+    nwc_safety_option: Mapped[Optional[str]] = mapped_column(String(5))
+    nwc_safety_score: Mapped[Optional[int]] = mapped_column(Integer)
+    nwc_total_score: Mapped[Optional[int]] = mapped_column(Integer)
+    # Strategic | Very Critical | Semi-Critical | Non-Critical
+    nwc_label: Mapped[Optional[str]] = mapped_column(String(50))
+    nwc_strategic_rules: Mapped[Optional[str]] = mapped_column(Text)   # JSON array
+
+    # ── LLM provenance ─────────────────────────────────────────────────────────
+    analysis_json: Mapped[Optional[str]] = mapped_column(Text)         # full LLM JSON
+    model_used: Mapped[Optional[str]] = mapped_column(String(150))
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(50))
+    inference_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Overall confidence from LLM ────────────────────────────────────────────
+    analysis_confidence: Mapped[Optional[float]] = mapped_column(Float)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     part: Mapped[SparePart] = relationship("SparePart", back_populates="assessments")
@@ -161,6 +188,38 @@ class Assessment(Base):
         back_populates="assessment",
         cascade="all, delete-orphan",
     )
+    dimension_scores: Mapped[list[NWCDimensionScore]] = relationship(
+        "NWCDimensionScore",
+        back_populates="assessment",
+        cascade="all, delete-orphan",
+    )
+
+
+class NWCDimensionScore(Base):
+    """
+    Detailed per-dimension analysis record for NWC assessments.
+    Stores the full LLM reasoning, confidence, and evidence for each dimension.
+    """
+
+    __tablename__ = "nwc_dimension_scores"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    assessment_id: Mapped[int] = mapped_column(ForeignKey("assessments.id"), nullable=False)
+    dimension: Mapped[str] = mapped_column(String(50), nullable=False)  # operations | water_quality | availability | safety
+    selected_option: Mapped[str] = mapped_column(String(5), nullable=False)
+    option_label: Mapped[Optional[str]] = mapped_column(Text)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    sources: Mapped[Optional[str]] = mapped_column(Text)               # JSON array
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    assessment: Mapped[Assessment] = relationship(
+        "Assessment", back_populates="dimension_scores"
+    )
+
+    __table_args__ = (UniqueConstraint("assessment_id", "dimension"),)
+
 
 
 class QuestionnaireAnswer(Base):

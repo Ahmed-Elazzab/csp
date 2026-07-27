@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -15,12 +16,12 @@ from sqlalchemy.orm import Session
 from src.database.connection import get_db_session
 from src.database.models import (
     Assessment,
+    NWCDimensionScore,
     PartAttribute,
-    QuestionnaireAnswer,
     ResearchSource,
     SparePart,
 )
-from src.utils.helpers import AssessmentResult, ResearchResult, SubmittedAnswer
+from src.utils.helpers import ResearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -203,56 +204,6 @@ class DatabaseAgent:
 
     # ── Assessment ────────────────────────────────────────────────────────────
 
-    def create_assessment(
-        self,
-        part_id: int,
-        result: AssessmentResult,
-        answers: list[SubmittedAnswer],
-        question_db_ids: dict[tuple[str, str], int],
-    ) -> int:
-        """Persist a complete assessment with all answers. Returns assessment id."""
-        with get_db_session() as session:
-            assessment = Assessment(
-                part_id=part_id,
-                operations_score=result.operations_score,
-                supply_chain_score=result.supply_chain_score,
-                inventory_score=result.inventory_score,
-                total_score=result.total_score,
-                label=result.label,
-                key_reasons=json.dumps(result.key_reasons),
-                override_rules_triggered=json.dumps(result.override_rules_triggered),
-                missing_attributes=json.dumps(result.missing_attributes),
-            )
-            session.add(assessment)
-            session.flush()
-
-            for ans in answers:
-                q_db_id = question_db_ids.get((ans.scenario, ans.question_id))
-                if q_db_id is None:
-                    continue
-                session.add(
-                    QuestionnaireAnswer(
-                        assessment_id=assessment.id,
-                        question_db_id=q_db_id,
-                        answer_value=ans.answer_value,
-                        answer_score=ans.answer_score,
-                        answered_by=ans.answered_by,
-                        confidence=ans.confidence,
-                        source=ans.source,
-                    )
-                )
-
-            session.flush()
-            assessment_id = assessment.id
-
-        logger.info(
-            "Assessment saved: id=%d, label=%s, score=%.1f",
-            assessment_id,
-            result.label,
-            result.total_score,
-        )
-        return assessment_id
-
     def confirm_assessment(
         self,
         assessment_id: int,
@@ -297,13 +248,107 @@ class DatabaseAgent:
                         "id": asm.id,
                         "part_number": part.part_number,
                         "part_name": part.part_name,
-                        "label": final_label,
-                        "total_score": asm.total_score,
+                        "label": asm.nwc_label or asm.override_label or asm.label,
+                        "total_score": asm.nwc_total_score or asm.total_score,
                         "ops_score": asm.operations_score,
                         "sc_score": asm.supply_chain_score,
                         "inv_score": asm.inventory_score,
+                        "nwc_total_score": asm.nwc_total_score,
+                        "nwc_label": asm.nwc_label,
                         "confirmed": asm.confirmed_by_user,
                         "created_at": asm.created_at,
+                        "model_used": asm.model_used,
                     }
                 )
             return result
+
+    # ── NWC Assessment ────────────────────────────────────────────────────────
+
+    def save_nwc_assessment(
+        self,
+        part_id: int,
+        nwc_result,  # NWCAssessmentResult from nwc_engine
+        analysis_json: str = "",
+    ) -> int:
+        """
+        Persist a complete NWC 4-dimension assessment.
+        Returns the assessment DB id.
+        """
+        from src.scoring.nwc_engine import DIMENSION_LABELS
+
+        with get_db_session() as session:
+            assessment = Assessment(
+                part_id=part_id,
+                # Legacy fields – kept for schema compatibility
+                operations_score=float(nwc_result.operations_score),
+                supply_chain_score=float(nwc_result.availability_score),
+                inventory_score=0.0,
+                total_score=float(nwc_result.total_score),
+                label=nwc_result.label,
+                key_reasons=json.dumps(nwc_result.key_reasons),
+                override_rules_triggered=json.dumps(nwc_result.strategic_rules_triggered),
+                assessment_version=2,
+                # NWC fields
+                nwc_operations_option=nwc_result.operations_option,
+                nwc_operations_score=nwc_result.operations_score,
+                nwc_water_quality_option=nwc_result.water_quality_option,
+                nwc_water_quality_score=nwc_result.water_quality_score,
+                nwc_availability_option=nwc_result.availability_option,
+                nwc_availability_score=nwc_result.availability_score,
+                nwc_safety_option=nwc_result.safety_option,
+                nwc_safety_score=nwc_result.safety_score,
+                nwc_total_score=nwc_result.total_score,
+                nwc_label=nwc_result.label,
+                nwc_strategic_rules=json.dumps(nwc_result.strategic_rules_triggered),
+                analysis_json=analysis_json,
+                model_used=nwc_result.model_used,
+                prompt_version=nwc_result.prompt_version,
+                inference_timestamp=datetime.now(timezone.utc),
+                analysis_confidence=nwc_result.overall_confidence,
+            )
+            session.add(assessment)
+            session.flush()
+            assessment_id = assessment.id
+
+            # Persist per-dimension detail rows
+            dim_map = {
+                "operations": (
+                    nwc_result.operations_option, nwc_result.operations_score,
+                    nwc_result.operations_label, nwc_result.operations_reason,
+                    nwc_result.operations_confidence, nwc_result.operations_sources,
+                ),
+                "water_quality": (
+                    nwc_result.water_quality_option, nwc_result.water_quality_score,
+                    nwc_result.water_quality_label, nwc_result.water_quality_reason,
+                    nwc_result.water_quality_confidence, nwc_result.water_quality_sources,
+                ),
+                "availability": (
+                    nwc_result.availability_option, nwc_result.availability_score,
+                    nwc_result.availability_label, nwc_result.availability_reason,
+                    nwc_result.availability_confidence, nwc_result.availability_sources,
+                ),
+                "safety": (
+                    nwc_result.safety_option, nwc_result.safety_score,
+                    nwc_result.safety_label, nwc_result.safety_reason,
+                    nwc_result.safety_confidence, nwc_result.safety_sources,
+                ),
+            }
+            for dim_name, (opt, score, lbl, reason, conf, srcs) in dim_map.items():
+                session.add(
+                    NWCDimensionScore(
+                        assessment_id=assessment_id,
+                        dimension=dim_name,
+                        selected_option=opt,
+                        option_label=lbl,
+                        score=score,
+                        confidence=conf,
+                        reason=reason,
+                        sources=json.dumps(srcs),
+                    )
+                )
+
+        logger.info(
+            "NWC assessment saved: id=%d part_id=%d label=%s score=%d",
+            assessment_id, part_id, nwc_result.label, nwc_result.total_score,
+        )
+        return assessment_id

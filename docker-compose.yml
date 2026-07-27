@@ -1,6 +1,6 @@
-version: "3.9"
-
 services:
+
+  # ── PostgreSQL database ───────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: csp_postgres
@@ -17,6 +17,30 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  # ── Streamlit application ─────────────────────────────────────────────────────
+  csp:
+    image: csp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: csp_app
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      # Override DB URL so the app container reaches the postgres service by name
+      DATABASE_URL: postgresql://csp_user:csp_pass@postgres:5432/csp_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Mount data directory so Excel file is accessible at runtime
+      - ./data:/app/data:ro
+    restart: unless-stopped
 
 volumes:
   csp_postgres_data:
+

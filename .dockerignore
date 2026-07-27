@@ -1,0 +1,39 @@
+# Version control
+.git
+.gitignore
+
+# Secrets – never bake into image
+.env
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+dist
+build
+.eggs
+
+# Test artefacts
+.pytest_cache
+.coverage
+htmlcov
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Data files that should be mounted at runtime, not baked in
+# (keep data/Critical Parts Attributes.xlsx — needed for Excel seed)

@@ -1,15 +1,23 @@
 """
-Research Agent – searches the web for a spare part and extracts structured attributes.
+Research Agent – Evidence Collection for NWC Spare Part Assessment
+===================================================================
 
-Prioritised source tiers:
-  1 = ERP / Manual input (not handled here)
-  2 = OEM datasheet
-  3 = Approved distributor / supplier
-  4 = Public website
-  5 = AI inference
+Collects engineering evidence from multiple pluggable sources.
+The agent is responsible ONLY for evidence collection, never for reasoning.
 
-When an OpenAI API key is configured the agent uses GPT to parse search snippets
-into structured JSON.  Without a key it falls back to heuristic extraction.
+Evidence Source Plugin Architecture
+------------------------------------
+Implement `EvidenceSource` to add new retrieval backends without changing ResearchAgent:
+  - TavilyEvidenceSource       (AI-native web search)
+  - DDGSEvidenceSource         (DuckDuckGo via library)
+  - DDGHTMLEvidenceSource      (DuckDuckGo plain-HTTP fallback)
+  - SerpAPIEvidenceSource      (Google-backed API)
+
+Future sources can be added without changing ResearchAgent:
+  - NWC maintenance manuals
+  - SAP Material Master
+  - Internal engineering standards
+  - Vector databases / RAG systems
 """
 
 from __future__ import annotations
@@ -18,16 +26,16 @@ import json
 import logging
 import re
 import time
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus, parse_qs, urlparse as _up
 
 import requests
 from bs4 import BeautifulSoup
 
 from src.config import get_settings
 from src.utils.helpers import (
-    SOURCE_TIER_AI,
     SOURCE_TIER_DISTRIBUTOR,
     SOURCE_TIER_OEM,
     SOURCE_TIER_WEB,
@@ -37,61 +45,171 @@ from src.utils.helpers import (
 
 logger = logging.getLogger(__name__)
 
-# Domains that must NEVER appear in spare-part search results
-_BLOCKED_DOMAINS: frozenset = frozenset({
-    "youtube.com", "youtu.be",
-    "facebook.com", "fb.com",
-    "twitter.com", "x.com",
-    "instagram.com", "tiktok.com",
-    "reddit.com", "pinterest.com",
-    "quora.com", "linkedin.com",
-    "wikipedia.org",            # too generic for part look-ups
-    "ebay.com", "amazon.com",   # consumer listings, not technical specs
+
+# ── Domain classifications ─────────────────────────────────────────────────────
+
+OEM_DOMAINS: frozenset[str] = frozenset({
+    "siemens.com", "abb.com", "schneider-electric.com", "emerson.com",
+    "honeywell.com", "rockwellautomation.com", "yokogawa.com", "endress.com",
+    "parker.com", "swagelok.com", "flowserve.com", "pentair.com",
+    "grundfos.com", "sulzer.com", "wika.com", "ksb.com", "weir.com",
+    "itt.com", "goulds.com", "flygt.com", "xylem.com",
 })
 
-# Negative terms appended to every DuckDuckGo / Google query
+DISTRIBUTOR_DOMAINS: frozenset[str] = frozenset({
+    "rs-online.com", "rscomponents.com", "digikey.com", "mouser.com",
+    "grainger.com", "mscdirect.com", "mcmaster.com", "farnell.com",
+    "element14.com", "automation24.com", "directindustry.com",
+})
+
+# Domains that MUST NEVER appear in spare-part evidence
+_BLOCKED_DOMAINS: frozenset[str] = frozenset({
+    # Social media
+    "youtube.com", "youtu.be", "facebook.com", "fb.com",
+    "twitter.com", "x.com", "instagram.com", "tiktok.com",
+    "reddit.com", "pinterest.com", "quora.com", "linkedin.com",
+    # Consumer e-commerce (not industrial suppliers)
+    "ebay.com", "amazon.com", "aliexpress.com", "alibaba.com",
+    # AI/LLM service documentation (not engineering parts)
+    "openai.com", "platform.openai.com", "docs.openai.com",
+    "anthropic.com", "docs.anthropic.com",
+    "ai.google.dev", "cloud.google.com",
+    # General encyclopedias / non-technical references
+    "wikipedia.org", "britannica.com", "britannica.co.uk",
+    "encyclopedia.com", "wikihow.com", "wikimedia.org",
+    # Historical / political / news (often false-positive for part-number prefixes)
+    "history.com", "historynet.com",
+    "bbc.com", "bbc.co.uk", "cnn.com", "reuters.com",
+    "nytimes.com", "theguardian.com", "washingtonpost.com",
+})
+
 _SITE_EXCL = (
     "-site:youtube.com -site:facebook.com -site:twitter.com "
-    "-site:x.com -site:reddit.com -site:instagram.com"
+    "-site:x.com -site:reddit.com -site:wikipedia.org "
+    "-site:britannica.com -site:openai.com"
 )
 
-# Anchor phrase that steers results toward industrial / technical content
-_INDUSTRY_CTX = 'industrial OR datasheet OR "spare part" OR specifications OR manufacturer'
+
+# ── Evidence quality helpers ───────────────────────────────────────────────────
+
+def _extract_part_tokens(part_query: str) -> set[str]:
+    """
+    Extract significant alphanumeric tokens from a part query.
+    These are used to score relevance of search results.
+
+    Examples:
+        "SS-1F0-3GC"      → {"SS", "1F0", "3GC"}
+        "3RV2011-1AA10"   → {"3RV2011", "1AA10"}
+        "Pump Seal Kit"   → {"Pump", "Seal", "Kit"}
+    """
+    # Split on non-alphanumeric characters
+    raw = re.split(r'[^a-zA-Z0-9]+', part_query.strip())
+    # Keep tokens that are meaningful (len >= 2, not pure common words)
+    _STOPWORDS = frozenset({"the", "a", "an", "of", "for", "in", "to",
+                             "and", "or", "with", "by", "is", "at"})
+    tokens = {t.upper() for t in raw if len(t) >= 2 and t.lower() not in _STOPWORDS}
+    return tokens
 
 
-def _filter_results(hits: list[dict]) -> list[dict]:
-    """Drop results whose host is in the irrelevant-domain blocklist."""
-    out = []
+def _score_relevance(part_tokens: set[str], hit: dict) -> float:
+    """
+    Score how relevant a search result is to the part query.
+    Returns 0.0 (unrelated) to 1.0 (highly relevant).
+
+    A result is relevant if it contains the specific tokens that make up
+    the part number/description.
+    """
+    if not part_tokens:
+        return 0.5  # Can't assess without tokens
+
+    text = (hit.get("title", "") + " " + hit.get("body", "")).upper()
+    matches = sum(1 for t in part_tokens if t in text)
+    return matches / len(part_tokens)
+
+
+def _filter_results(part_query: str, hits: list[dict]) -> tuple[list[dict], str]:
+    """
+    Filter search results by:
+      1. Domain blocklist (social media, encyclopedias, AI service docs, news)
+      2. Relevance score (must contain part number tokens)
+
+    Returns (filtered_hits, evidence_quality) where quality is
+    "good" | "partial" | "insufficient".
+    """
+    if not hits:
+        return [], "insufficient"
+
+    part_tokens = _extract_part_tokens(part_query)
+    logger.debug(
+        "Evidence filter — part_query=%r tokens=%s candidates=%d",
+        part_query, part_tokens, len(hits)
+    )
+
+    # ── Step 1: Domain blocklist ──────────────────────────────────────────────
+    domain_passed: list[dict] = []
     for h in hits:
         try:
             host = urlparse(h.get("href", "")).netloc.lstrip("www.").lower()
             if any(host == d or host.endswith("." + d) for d in _BLOCKED_DOMAINS):
-                logger.debug("Blocked irrelevant result: %s", h.get("href"))
+                logger.debug("  BLOCKED domain: %s — %s", host, h.get("title", "")[:60])
                 continue
         except Exception:
             pass
-        out.append(h)
-    return out
+        domain_passed.append(h)
 
-# Known OEM / manufacturer domains → tier 2
-OEM_DOMAINS: set[str] = {
-    "siemens.com", "abb.com", "schneider-electric.com", "emerson.com",
-    "honeywell.com", "rockwellautomation.com", "yokogawa.com", "endress.com",
-    "parker.com", "swagelok.com", "flowserve.com", "pentair.com",
-    "grundfos.com", "sulzer.com", "wika.com",
-}
+    logger.debug("  After domain filter: %d/%d results remain", len(domain_passed), len(hits))
 
-# Known distributor domains → tier 3
-DISTRIBUTOR_DOMAINS: set[str] = {
-    "rs-online.com", "rscomponents.com", "digikey.com", "mouser.com",
-    "grainger.com", "mscdirect.com", "mcmaster.com", "farnell.com",
-    "element14.com", "automation24.com", "directindustry.com",
-}
+    if not domain_passed:
+        return [], "insufficient"
+
+    # ── Step 2: Relevance scoring ─────────────────────────────────────────────
+    scored: list[tuple[float, dict]] = []
+    for h in domain_passed:
+        score = _score_relevance(part_tokens, h)
+        scored.append((score, h))
+        logger.debug(
+            "  Relevance %.2f — %s — %s",
+            score, urlparse(h.get("href", "")).netloc[:40], h.get("title", "")[:60]
+        )
+
+    scored.sort(key=lambda x: -x[0])
+
+    # Separate into relevant and potentially irrelevant
+    RELEVANCE_THRESHOLD = 0.25  # at least 25% of part tokens must appear
+    relevant    = [(s, h) for s, h in scored if s >= RELEVANCE_THRESHOLD]
+    irrelevant  = [(s, h) for s, h in scored if s < RELEVANCE_THRESHOLD]
+
+    logger.info(
+        "Evidence relevance — part=%r tokens=%s relevant=%d irrelevant=%d",
+        part_query[:40], part_tokens, len(relevant), len(irrelevant)
+    )
+
+    if irrelevant:
+        for s, h in irrelevant:
+            logger.warning(
+                "IRRELEVANT result filtered (score=%.2f): %s — %s",
+                s, h.get("href", "")[:80], h.get("title", "")[:60]
+            )
+
+    if relevant:
+        # Good: at least some results are relevant
+        quality = "good" if len(relevant) >= 3 else "partial"
+        return [h for _, h in relevant], quality
+
+    # No relevant results — log clearly and return a warning
+    logger.error(
+        "NO RELEVANT EVIDENCE for part '%s'. "
+        "Top domains returned by search: %s. "
+        "These results will NOT be passed to the LLM.",
+        part_query,
+        [urlparse(h.get("href", "")).netloc for _, h in scored[:5]],
+    )
+    return [], "insufficient"
 
 
 def _classify_url_tier(url: str) -> int:
     try:
-        host = urlparse(url).netloc.lstrip("www.")
+        host = urlparse(url).netloc.lstrip("www.").lower()
         if any(host.endswith(d) for d in OEM_DOMAINS):
             return SOURCE_TIER_OEM
         if any(host.endswith(d) for d in DISTRIBUTOR_DOMAINS):
@@ -101,208 +219,107 @@ def _classify_url_tier(url: str) -> int:
     return SOURCE_TIER_WEB
 
 
-def _safe_get(url: str, timeout: int = 8) -> Optional[str]:
-    """Fetch page text; return None on error."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (compatible; CSP-Research-Bot/1.0; "
-            "+https://github.com/csp-assessment)"
-        )
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        return soup.get_text(separator=" ", strip=True)[:4000]
-    except Exception as exc:
-        logger.debug("Fetch failed %s: %s", url, exc)
-        return None
+# ── EvidenceSource plugin interface ───────────────────────────────────────────
 
+class EvidenceSource(ABC):
+    """
+    Abstract base for evidence collection backends.
+    Subclass this to add new retrieval sources without modifying ResearchAgent.
+    """
 
-class ResearchAgent:
-    """Searches the web for a spare part and returns structured ResearchResult."""
-
-    def __init__(self) -> None:
-        self.settings = get_settings()
-        self._openai_client = None
-        if self.settings.OPENAI_API_KEY:
-            try:
-                from openai import OpenAI  # type: ignore
-
-                self._openai_client = OpenAI(
-                    api_key=self.settings.OPENAI_API_KEY,
-                    base_url=self.settings.OPENAI_BASE_URL,
-                )
-                logger.info("ResearchAgent: OpenAI client ready (%s)", self.settings.OPENAI_MODEL)
-            except Exception as exc:
-                logger.warning("OpenAI init failed: %s", exc)
-
-    # ── Public entry point ────────────────────────────────────────────────────
-
-    def research_part(self, part_number: str) -> ResearchResult:
-        """Run the full research pipeline for a part number."""
-        result = ResearchResult(part_number=part_number)
-
-        search_hits = self._web_search(part_number)
-        result.raw_search_results = search_hits
-
-        # Deduplicate and classify sources
-        for hit in search_hits:
-            tier = _classify_url_tier(hit.get("href", ""))
-            result.source_urls.append(
-                {
-                    "url": hit.get("href", ""),
-                    "title": hit.get("title", ""),
-                    "snippet": hit.get("body", "")[:300],
-                    "tier": tier,
-                }
-            )
-
-        if not search_hits:
-            logger.warning("No search results for part %s", part_number)
-            return result
-
-        if self._openai_client:
-            extracted = self._extract_with_openai(part_number, search_hits)
-        else:
-            extracted = self._extract_heuristic(part_number, search_hits)
-
-        self._populate_result(result, extracted, search_hits)
-        return result
-
-    # ── Web search (multi-strategy with hard timeout) ─────────────────────────
-
-    def _web_search(self, part_number: str) -> list[dict]:
+    @abstractmethod
+    def collect(self, query: str, max_results: int) -> list[dict]:
         """
-        Run all search strategies inside a single hard timeout thread.
-        If the corporate network blocks everything, this fails in SEARCH_TIMEOUT
-        seconds (default 12s) instead of hanging for 60+ seconds.
-
-        Strategies tried in order:
-          1. DuckDuckGo DDGS library
-          2. DuckDuckGo HTML endpoint (plain HTTP)
-          3. SerpAPI (only when SERPAPI_KEY is set)
+        Collect evidence items.
+        Returns list of {href, title, body} dicts.
+        Never raises — returns [] on any failure.
         """
-        timeout = self.settings.SEARCH_TIMEOUT
-        if timeout <= 0:
-            return self._run_search_strategies(part_number)
+        ...
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(self._run_search_strategies, part_number)
-            try:
-                return future.result(timeout=timeout)
-            except FuturesTimeout:
-                logger.warning(
-                    "Web search timed out after %ds for '%s'. "
-                    "Corporate network may be blocking outbound requests. "
-                    "Set SEARCH_TIMEOUT=0 to disable the timeout, or use a "
-                    "SERPAPI_KEY / VPN for reliable access.",
-                    timeout,
-                    part_number,
-                )
-                return []
-            except Exception as exc:
-                logger.error("Web search thread error: %s", exc)
-                return []
+    @property
+    @abstractmethod
+    def source_name(self) -> str:
+        ...
 
-    def _run_search_strategies(self, part_number: str) -> list[dict]:
-        """
-        Execute search strategies in priority order until one returns results.
+    @property
+    def trust_tier(self) -> int:
+        return SOURCE_TIER_WEB
 
-        Priority:
-          1. Tavily   — AI-native, high relevance, 1 000 free/month
-          2. DDGS     — DuckDuckGo library (free, rate-limited in WSL/corporate)
-          3. DDG HTML — plain-HTTP DuckDuckGo fallback
-          4. SerpAPI  — Google-backed API (100 free/month)
-        """
-        if self.settings.TAVILY_API_KEY:
-            hits = self._search_tavily(part_number)
-            if hits:
-                return _filter_results(hits)
-            logger.info("Tavily returned no results – falling back to DDGS")
+    @classmethod
+    def is_configured(cls, settings) -> bool:
+        return True
 
-        hits = self._search_duckduckgo_ddgs(part_number)
-        if hits:
-            return _filter_results(hits)
 
-        logger.info("DDGS returned no results – trying HTML fallback")
-        hits = self._search_duckduckgo_html(part_number)
-        if hits:
-            return _filter_results(hits)
+# ── Concrete source implementations ───────────────────────────────────────────
 
-        if self.settings.SERPAPI_KEY:
-            logger.info("HTML fallback empty – trying SerpAPI")
-            hits = self._search_serpapi(part_number)
-            if hits:
-                return _filter_results(hits)
+class TavilyEvidenceSource(EvidenceSource):
+    """
+    Tavily AI-native search — recommended for industrial/technical content.
+    Uses exact part number as primary search term, context only as secondary.
+    """
 
-        logger.warning(
-            "All search strategies failed for '%s'. "
-            "Outbound web access appears blocked.",
-            part_number,
-        )
-        return []
+    def __init__(self, settings) -> None:
+        self._s = settings
 
-    def _search_tavily(self, part_number: str) -> list[dict]:
-        """
-        Tavily AI search – purpose-built for agent workflows.
+    @classmethod
+    def is_configured(cls, settings) -> bool:
+        return bool(settings.TAVILY_API_KEY)
 
-        Docs: https://docs.tavily.com/sdk/python/reference
-        Free tier: 1 000 searches / month at https://app.tavily.com
-        """
+    @property
+    def source_name(self) -> str:
+        return "Tavily"
+
+    def collect(self, query: str, max_results: int) -> list[dict]:
         try:
             from tavily import TavilyClient  # type: ignore
+            client = TavilyClient(api_key=self._s.TAVILY_API_KEY)
 
-            client = TavilyClient(api_key=self.settings.TAVILY_API_KEY)
-            query = (
-                f"{part_number} spare part technical specifications "
-                f"manufacturer datasheet industrial"
-            )
-            response = client.search(
-                query=query,
-                search_depth="advanced",   # uses AI ranking; "basic" is faster
-                max_results=self.settings.SEARCH_MAX_RESULTS * 2,
+            # Primary: exact part number with engineering context (NOT too many generic terms)
+            primary_query = f"{query} technical datasheet specifications"
+            logger.info("[Tavily] Sending query: %r", primary_query)
+
+            resp = client.search(
+                query=primary_query,
+                search_depth="advanced",
+                max_results=max_results * 2,
                 include_answer=False,
-                include_raw_content=False,
             )
             hits = [
                 {
-                    "href": r.get("url", ""),
+                    "href":  r.get("url", ""),
                     "title": r.get("title", ""),
-                    "body": r.get("content", ""),
+                    "body":  r.get("content", ""),
                 }
-                for r in response.get("results", [])
-                if r.get("url")
+                for r in resp.get("results", []) if r.get("url")
             ]
-            logger.info("Tavily returned %d hits", len(hits))
+            logger.info("[Tavily] Raw results: %d", len(hits))
+            for h in hits:
+                logger.debug("  [Tavily] %s — %s", h["href"][:80], h["title"][:60])
             return hits
         except ImportError:
-            logger.warning("tavily-python not installed – run: pip install tavily-python")
+            logger.warning("tavily-python not installed — run: pip install tavily-python")
             return []
         except Exception as exc:
-            logger.warning("Tavily search failed: %s", exc)
+            logger.warning("[Tavily] Search failed: %s", exc)
             return []
 
-    def _search_duckduckgo_ddgs(self, part_number: str) -> list[dict]:
-        """DuckDuckGo via the duckduckgo-search library – 2 retries max."""
-        # Three query tiers, from most specific to broadest:
-        #  1. Exact part number + site exclusions (highest precision)
-        #  2. Exact part number + industrial context
-        #  3. Bare part number + industry anchor (broadest fallback)
+
+class DDGSEvidenceSource(EvidenceSource):
+    """DuckDuckGo via duckduckgo-search library."""
+
+    def __init__(self, settings) -> None:
+        self._s = settings
+
+    @property
+    def source_name(self) -> str:
+        return "DuckDuckGo (DDGS)"
+
+    def collect(self, query: str, max_results: int) -> list[dict]:
+        # Try quoted exact match first, then broader fallback
         query_sets = [
-            [
-                f'"{part_number}" {_SITE_EXCL}',
-                f'"{part_number}" datasheet specifications {_SITE_EXCL}',
-            ],
-            [
-                f'"{part_number}" {_INDUSTRY_CTX}',
-                f'"{part_number}" technical industrial',
-            ],
-            [
-                f'{part_number} {_INDUSTRY_CTX} {_SITE_EXCL}',
-            ],
+            [f'"{query}" technical datasheet {_SITE_EXCL}'],
+            [f'"{query}" spare part {_SITE_EXCL}'],
+            [f'{query} industrial technical {_SITE_EXCL}'],
         ]
         for queries in query_sets:
             hits: list[dict] = []
@@ -310,48 +327,52 @@ class ResearchAgent:
             for attempt in range(2):
                 try:
                     from duckduckgo_search import DDGS  # type: ignore
-
                     with DDGS() as ddgs:
                         for q in queries:
-                            for r in ddgs.text(q, max_results=self.settings.SEARCH_MAX_RESULTS):
+                            logger.info("[DDGS] Sending query: %r", q)
+                            for r in ddgs.text(q, max_results=max_results):
                                 href = r.get("href", "")
                                 if href and href not in seen:
                                     seen.add(href)
                                     hits.append(r)
+                                    logger.debug("  [DDGS] %s — %s", href[:80], r.get("title", "")[:60])
                             time.sleep(0.8)
                     if hits:
-                        logger.info("DDGS returned %d hits", len(hits))
-                        return hits[: self.settings.SEARCH_MAX_RESULTS * 2]
+                        return hits[:max_results * 2]
                 except Exception as exc:
                     wait = 1.5 ** attempt
-                    logger.warning("DDGS attempt %d failed (%s) – retrying in %.1fs", attempt + 1, exc, wait)
+                    logger.warning("[DDGS] Attempt %d failed: %s — retrying in %.1fs", attempt + 1, exc, wait)
                     time.sleep(wait)
         return []
 
-    def _search_duckduckgo_html(self, part_number: str) -> list[dict]:
-        """Parse DuckDuckGo's lightweight HTML endpoint – no JS, no Cloudflare."""
-        from urllib.parse import quote_plus, parse_qs, urlparse as _up
 
-        # Include exclusions and industry context directly in the query string
-        query = (
-            f'"{part_number}" {_INDUSTRY_CTX} '
-            f'-site:youtube.com -site:facebook.com -site:reddit.com'
-        )
-        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}&ia=web"
+class DDGHTMLEvidenceSource(EvidenceSource):
+    """DuckDuckGo plain-HTTP endpoint — more WSL/corporate-network friendly."""
+
+    def __init__(self, settings) -> None:
+        self._s = settings
+
+    @property
+    def source_name(self) -> str:
+        return "DuckDuckGo (HTML)"
+
+    def collect(self, query: str, max_results: int) -> list[dict]:
+        full_query = f'"{query}" technical datasheet {_SITE_EXCL}'
+        url = f"https://html.duckduckgo.com/html/?q={quote_plus(full_query)}&ia=web"
+        logger.info("[DDG-HTML] Sending query: %r", full_query)
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
         }
         try:
             resp = requests.get(url, headers=headers, timeout=8)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "lxml")
             hits: list[dict] = []
-            for result in soup.select(".result")[: self.settings.SEARCH_MAX_RESULTS * 2]:
+            for result in soup.select(".result")[:max_results * 2]:
                 link_el = result.select_one(".result__a")
                 snippet_el = result.select_one(".result__snippet")
                 if not link_el:
@@ -367,111 +388,274 @@ class ResearchAgent:
                     "href": href,
                     "body": snippet_el.get_text(strip=True) if snippet_el else "",
                 })
-            logger.info("DDG HTML fallback returned %d hits", len(hits))
+                logger.debug("  [DDG-HTML] %s — %s", href[:80], link_el.get_text(strip=True)[:60])
+            logger.info("[DDG-HTML] Raw results: %d", len(hits))
             return hits
         except Exception as exc:
-            logger.warning("DDG HTML fallback failed: %s", exc)
+            logger.warning("[DDG-HTML] Failed: %s", exc)
             return []
 
-    def _search_serpapi(self, part_number: str) -> list[dict]:
-        """SerpAPI (Google Search) – reliable in any network with an API key."""
+
+class SerpAPIEvidenceSource(EvidenceSource):
+    """SerpAPI Google-backed search."""
+
+    def __init__(self, settings) -> None:
+        self._s = settings
+
+    @classmethod
+    def is_configured(cls, settings) -> bool:
+        return bool(settings.SERPAPI_KEY)
+
+    @property
+    def source_name(self) -> str:
+        return "SerpAPI"
+
+    def collect(self, query: str, max_results: int) -> list[dict]:
+        q = f'"{query}" technical datasheet {_SITE_EXCL}'
+        logger.info("[SerpAPI] Sending query: %r", q)
         try:
             resp = requests.get(
                 "https://serpapi.com/search",
-                params={
-                    "q": (
-                        f'"{part_number}" industrial OR datasheet OR specifications '
-                        f"-site:youtube.com -site:facebook.com -site:reddit.com"
-                    ),
-                    "api_key": self.settings.SERPAPI_KEY,
-                    "num": self.settings.SEARCH_MAX_RESULTS * 2,
-                    "hl": "en",
-                },
+                params={"q": q, "api_key": self._s.SERPAPI_KEY,
+                        "num": max_results * 2, "hl": "en"},
                 timeout=10,
             )
             resp.raise_for_status()
             hits = [
-                {"title": r.get("title", ""), "href": r.get("link", ""), "body": r.get("snippet", "")}
+                {"href": r.get("link", ""), "title": r.get("title", ""), "body": r.get("snippet", "")}
                 for r in resp.json().get("organic_results", [])
             ]
-            logger.info("SerpAPI returned %d hits", len(hits))
+            logger.info("[SerpAPI] Raw results: %d", len(hits))
             return hits
         except Exception as exc:
-            logger.warning("SerpAPI failed: %s", exc)
+            logger.warning("[SerpAPI] Failed: %s", exc)
             return []
 
-    # ── OpenAI extraction ─────────────────────────────────────────────────────
 
-    def _extract_with_openai(
-        self, part_number: str, hits: list[dict]
-    ) -> dict[str, Any]:
-        """Use OpenAI to parse search snippets into structured attributes."""
+# ── ResearchAgent ──────────────────────────────────────────────────────────────
+
+class ResearchAgent:
+    """
+    Collects engineering evidence for a spare part using configured sources.
+
+    Evidence collection flow:
+      1. Try each source in priority order until relevant results found
+      2. Apply domain blocklist (social media, encyclopedias, AI services, news)
+      3. Apply relevance scoring (must contain part-number tokens)
+      4. Return evidence quality indicator alongside results
+    """
+
+    def __init__(self, sources: Optional[list[EvidenceSource]] = None) -> None:
+        self._settings = get_settings()
+        self._sources = sources if sources is not None else self._build_default_sources()
+        self._openai_client = None
+
+        if self._settings.effective_llm_api_key and self._settings.LLM_PROVIDER in (
+            "openai", "azure_openai", "ollama", "openai_compatible", "lmstudio", "vllm"
+        ):
+            try:
+                from openai import OpenAI  # type: ignore
+                self._openai_client = OpenAI(
+                    api_key=self._settings.effective_llm_api_key,
+                    base_url=self._settings.LLM_BASE_URL or None,
+                    timeout=30,
+                    max_retries=1,
+                )
+                logger.debug("Research extraction LLM client ready")
+            except Exception as exc:
+                logger.debug("Research LLM client unavailable: %s", exc)
+
+    def _build_default_sources(self) -> list[EvidenceSource]:
+        settings = self._settings
+        sources: list[EvidenceSource] = []
+        if TavilyEvidenceSource.is_configured(settings):
+            sources.append(TavilyEvidenceSource(settings))
+        sources.append(DDGSEvidenceSource(settings))
+        sources.append(DDGHTMLEvidenceSource(settings))
+        if SerpAPIEvidenceSource.is_configured(settings):
+            sources.append(SerpAPIEvidenceSource(settings))
+        logger.info(
+            "ResearchAgent sources: %s",
+            [s.source_name for s in sources],
+        )
+        return sources
+
+    def research_part(self, part_number: str) -> ResearchResult:
+        """
+        Collect engineering evidence for a spare part.
+        
+        Returns a ResearchResult with:
+        - source_urls: only relevant, domain-filtered, relevance-scored results
+        - attributes: extracted structured data
+        - overall_confidence: quality indicator
+        - evidence_quality: "good" | "partial" | "insufficient"
+        """
+        logger.info(
+            "=== ResearchAgent.research_part START: input=%r ===",
+            part_number,
+        )
+        result = ResearchResult(part_number=part_number)
+
+        raw_hits, evidence_quality = self._collect_evidence(part_number)
+
+        logger.info(
+            "Evidence collection complete: %d relevant hits, quality=%s",
+            len(raw_hits), evidence_quality,
+        )
+
+        # Populate source_urls ONLY from relevant, filtered hits
+        seen_urls: set[str] = set()
+        for hit in raw_hits:
+            url = hit.get("href", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                tier = _classify_url_tier(url)
+                result.source_urls.append({
+                    "url": url,
+                    "title": hit.get("title", ""),
+                    "snippet": hit.get("body", "")[:300],
+                    "tier": tier,
+                })
+                logger.debug("Accepted source: [tier=%d] %s — %s", tier, url[:70], hit.get("title", "")[:60])
+
+        # Store quality indicator for downstream use
+        result.raw_search_results = raw_hits
+
+        if evidence_quality == "insufficient" or not raw_hits:
+            logger.warning(
+                "INSUFFICIENT EVIDENCE for part '%s'. "
+                "LLM will receive explicit notice of missing evidence.",
+                part_number,
+            )
+            result.overall_confidence = 0.05
+            # Store quality marker in attributes for downstream agents
+            result.attributes["_evidence_quality"] = AttributeData(
+                value="insufficient",
+                source="ResearchAgent",
+                confidence=0.0,
+                source_tier=5,
+            )
+            return result
+
+        # Extract structured attributes
+        if self._openai_client:
+            extracted = self._extract_with_llm(part_number, raw_hits)
+        else:
+            extracted = self._extract_heuristic(part_number, raw_hits)
+
+        self._populate_result(result, extracted, raw_hits, evidence_quality)
+        result.attributes["_evidence_quality"] = AttributeData(
+            value=evidence_quality,
+            source="ResearchAgent",
+            confidence=1.0 if evidence_quality == "good" else 0.6,
+            source_tier=5,
+        )
+        logger.info(
+            "=== ResearchAgent.research_part END: part=%r sources=%d confidence=%.0f%% ===",
+            part_number, len(result.source_urls), result.overall_confidence * 100,
+        )
+        return result
+
+    # ── Evidence collection ───────────────────────────────────────────────────
+
+    def _collect_evidence(self, part_number: str) -> tuple[list[dict], str]:
+        """
+        Try each source in priority order; apply domain + relevance filtering.
+        Returns (filtered_hits, evidence_quality).
+        """
+        timeout = self._settings.SEARCH_TIMEOUT
+        max_results = self._settings.SEARCH_MAX_RESULTS
+
+        def _run() -> tuple[list[dict], str]:
+            for source in self._sources:
+                logger.info("Trying evidence source: %s", source.source_name)
+                try:
+                    raw = source.collect(part_number, max_results)
+                except Exception as exc:
+                    logger.warning("Source %s raised unexpectedly: %s", source.source_name, exc)
+                    raw = []
+
+                if not raw:
+                    logger.info("  → No raw results from %s", source.source_name)
+                    continue
+
+                filtered, quality = _filter_results(part_number, raw)
+                logger.info(
+                    "  → %s: %d raw → %d filtered (quality=%s)",
+                    source.source_name, len(raw), len(filtered), quality,
+                )
+                if filtered:
+                    return filtered[:max_results * 2], quality
+
+            logger.warning("All sources exhausted — no relevant evidence for '%s'", part_number)
+            return [], "insufficient"
+
+        if timeout <= 0:
+            return _run()
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_run)
+            try:
+                return future.result(timeout=timeout)
+            except FuturesTimeout:
+                logger.error(
+                    "Evidence collection timed out after %ds for '%s'",
+                    timeout, part_number,
+                )
+                return [], "insufficient"
+
+    # ── LLM extraction ────────────────────────────────────────────────────────
+
+    def _extract_with_llm(self, part_number: str, hits: list[dict]) -> dict[str, Any]:
+        """Use LLM to extract structured part attributes from search snippets."""
         combined = "\n\n".join(
-            f"Source: {h.get('href','')}\nTitle: {h.get('title','')}\nSnippet: {h.get('body','')[:600]}"
+            f"Source: {h.get('href', '')}\nTitle: {h.get('title', '')}\n"
+            f"Content: {h.get('body', '')[:600]}"
             for h in hits[:6]
         )
-        system_msg = (
-            "You are a spare-parts information extraction assistant. "
-            "Return ONLY valid JSON – no markdown, no extra text."
+        prompt = (
+            f"Extract spare-part information for part number: {part_number}\n\n"
+            f"Evidence:\n{combined}\n\n"
+            "Return JSON with these keys (null if not found in evidence — do NOT invent facts):\n"
+            '{"part_name":null,"description":null,"manufacturer":null,'
+            '"model_number":null,"part_type":null,"technical_specs":null,'
+            '"typical_usage":null,"supplier_info":null,"country_of_origin":null,'
+            '"oem_only":null,"substitute_available":null,'
+            '"obsolescence_risk":null,"confidence":0.0}'
         )
-        user_msg = f"""Extract spare-part information for part number: {part_number}
-
-Search results:
-{combined}
-
-Return JSON with these keys (use null if unknown):
-{{
-  "part_name": "string",
-  "description": "string",
-  "manufacturer": "string",
-  "model_number": "string",
-  "part_type": "type/category e.g. pump, valve, motor, sensor",
-  "technical_specs": "key technical specs as plain text",
-  "typical_usage": "string",
-  "supplier_info": "string",
-  "country_of_origin": "string",
-  "oem_only": true/false/null,
-  "substitute_available": true/false/null,
-  "obsolescence_risk": "low/medium/high or null",
-  "confidence": 0.0-1.0,
-  "notes": "any other relevant info"
-}}"""
+        logger.debug("[Research LLM Extract] Prompt:\n%s", prompt[:800])
         try:
             resp = self._openai_client.chat.completions.create(
-                model=self.settings.OPENAI_MODEL,
+                model=self._settings.LLM_MODEL,
                 messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
+                    {"role": "system",
+                     "content": "Extract only facts found in the provided evidence. "
+                                "Return only valid JSON. Never invent information."},
+                    {"role": "user", "content": prompt},
                 ],
-                temperature=0.1,
+                temperature=0.0,
                 response_format={"type": "json_object"},
             )
-            raw = resp.choices[0].message.content
-            return json.loads(raw)
+            raw_resp = resp.choices[0].message.content or "{}"
+            logger.debug("[Research LLM Extract] Raw response: %s", raw_resp[:400])
+            return json.loads(raw_resp)
         except Exception as exc:
-            logger.error("OpenAI extraction failed: %s", exc)
+            logger.warning("[Research LLM Extract] Failed: %s — using heuristic", exc)
             return self._extract_heuristic(part_number, hits)
 
-    # ── Heuristic fallback ────────────────────────────────────────────────────
+    # ── Heuristic extraction ──────────────────────────────────────────────────
 
-    def _extract_heuristic(
-        self, part_number: str, hits: list[dict]
-    ) -> dict[str, Any]:
-        """Regex-based extraction when OpenAI is unavailable."""
-        combined_text = " ".join(
-            f"{h.get('title', '')} {h.get('body', '')}" for h in hits
-        ).lower()
-        titles = [h.get("title", "") for h in hits]
-        best_title = titles[0] if titles else part_number
+    def _extract_heuristic(self, part_number: str, hits: list[dict]) -> dict[str, Any]:
+        """Regex-based extraction when LLM is unavailable."""
+        combined = " ".join(f"{h.get('title', '')} {h.get('body', '')}" for h in hits).lower()
+        best_title = hits[0].get("title", part_number) if hits else part_number
 
-        # Try to extract manufacturer from title/snippets
         manufacturer = None
-        mfr_patterns = [
-            r"by\s+([A-Z][a-zA-Z\s&]+(?:Inc|Ltd|Corp|GmbH|AG|Co)?)",
-            r"([A-Z][a-zA-Z]+)\s+(?:part|spare|component|model)",
-        ]
-        for hit in hits:
-            for pat in mfr_patterns:
+        for pat in [
+            r"\b([A-Z][a-zA-Z]+(?:[\s][A-Z][a-zA-Z]+)*)\s+(?:part|spare|fitting|valve|pump|motor|sensor)\b",
+            r"\bby\s+([A-Z][a-zA-Z\s&]+(?:Inc|Ltd|Corp|GmbH|AG|Co)?)[\.,]",
+        ]:
+            for hit in hits:
                 m = re.search(pat, hit.get("title", "") + " " + hit.get("body", ""))
                 if m:
                     manufacturer = m.group(1).strip()
@@ -479,24 +663,12 @@ Return JSON with these keys (use null if unknown):
             if manufacturer:
                 break
 
-        # OEM-only hints
-        oem_only = None
-        if "oem only" in combined_text or "genuine oem" in combined_text:
-            oem_only = True
-        elif "aftermarket" in combined_text or "compatible" in combined_text:
-            oem_only = False
-
-        # Obsolescence
-        obs_risk = None
-        if "discontinued" in combined_text or "obsolete" in combined_text:
-            obs_risk = "high"
-        elif "end of life" in combined_text or "eol" in combined_text:
-            obs_risk = "medium"
-
-        confidence = 0.35 if hits else 0.0
+        oem_only = True if "oem only" in combined else (False if "aftermarket" in combined else None)
+        obs_risk = "high" if "discontinued" in combined or "obsolete" in combined else (
+                   "medium" if "end of life" in combined else None)
 
         return {
-            "part_name": best_title[:120] if best_title else part_number,
+            "part_name": best_title[:120],
             "description": hits[0].get("body", "")[:400] if hits else None,
             "manufacturer": manufacturer,
             "model_number": part_number,
@@ -508,8 +680,7 @@ Return JSON with these keys (use null if unknown):
             "oem_only": oem_only,
             "substitute_available": None,
             "obsolescence_risk": obs_risk,
-            "confidence": confidence,
-            "notes": None,
+            "confidence": 0.35 if hits else 0.05,
         }
 
     # ── Result population ─────────────────────────────────────────────────────
@@ -517,25 +688,34 @@ Return JSON with these keys (use null if unknown):
     def _populate_result(
         self,
         result: ResearchResult,
-        extracted: dict[str, Any],
+        extracted: dict,
         hits: list[dict],
+        evidence_quality: str,
     ) -> None:
-        confidence = float(extracted.get("confidence") or 0.4)
+        conf = float(extracted.get("confidence") or 0.4)
 
-        result.part_name = extracted.get("part_name")
-        result.description = extracted.get("description")
-        result.manufacturer = extracted.get("manufacturer")
-        result.model_number = extracted.get("model_number")
-        result.part_type = extracted.get("part_type")
-        result.technical_specs = extracted.get("technical_specs")
-        result.country_of_origin = extracted.get("country_of_origin")
-        result.oem_only = extracted.get("oem_only")
+        def _str(val: Any) -> Optional[str]:
+            """Ensure a value from LLM extraction is a plain string or None."""
+            if val is None:
+                return None
+            if isinstance(val, str):
+                return val or None
+            # LLM sometimes returns a dict or list — stringify it
+            return str(val)
+
+        result.part_name            = _str(extracted.get("part_name"))
+        result.description          = _str(extracted.get("description"))
+        result.manufacturer         = _str(extracted.get("manufacturer"))
+        result.model_number         = _str(extracted.get("model_number"))
+        result.part_type            = _str(extracted.get("part_type"))
+        result.technical_specs      = _str(extracted.get("technical_specs"))
+        result.country_of_origin    = _str(extracted.get("country_of_origin"))
+        result.oem_only             = extracted.get("oem_only")
         result.substitute_available = extracted.get("substitute_available")
-        result.obsolescence_risk = extracted.get("obsolescence_risk")
-        result.supplier_info = extracted.get("supplier_info")
-        result.overall_confidence = confidence
+        result.obsolescence_risk    = _str(extracted.get("obsolescence_risk"))
+        result.supplier_info        = _str(extracted.get("supplier_info"))
+        result.overall_confidence   = conf if evidence_quality != "insufficient" else 0.05
 
-        # Identify best source URL (prefer highest tier = lowest number)
         best_url: Optional[str] = None
         best_tier = 99
         for src in result.source_urls:
@@ -543,21 +723,17 @@ Return JSON with these keys (use null if unknown):
                 best_tier = src["tier"]
                 best_url = src["url"]
 
-        src_label = f"Web search (tier {best_tier})"
-        tier = best_tier
+        src_label = f"Web ({best_tier})"
 
         def _attr(name: str, val: Any) -> None:
             if val is not None:
                 result.attributes[name] = AttributeData(
-                    value=str(val),
-                    source=src_label,
-                    source_url=best_url,
-                    confidence=confidence,
-                    source_tier=tier,
+                    value=str(val), source=src_label,
+                    source_url=best_url, confidence=conf, source_tier=best_tier,
                 )
 
-        _attr("oem_only_requirement", result.oem_only)
+        _attr("oem_only_requirement",             result.oem_only)
         _attr("approved_substitute_availability", result.substitute_available)
-        _attr("obsolescence_risk", result.obsolescence_risk)
-        _attr("local_presence_distributor_availability",
-              "local" if tier <= SOURCE_TIER_DISTRIBUTOR else None)
+        _attr("obsolescence_risk",                result.obsolescence_risk)
+        if best_tier <= SOURCE_TIER_DISTRIBUTOR:
+            _attr("local_presence_distributor_availability", "local")
