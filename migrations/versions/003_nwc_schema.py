@@ -37,23 +37,26 @@ def upgrade() -> None:
         batch.add_column(sa.Column("inference_timestamp",      sa.DateTime(),  nullable=True))
         batch.add_column(sa.Column("analysis_confidence",      sa.Float(),     nullable=True))
 
-    # ── New nwc_dimension_scores table ─────────────────────────────────────────
-    op.create_table(
-        "nwc_dimension_scores",
-        sa.Column("id",            sa.Integer(),   nullable=False),
-        sa.Column("assessment_id", sa.Integer(),   nullable=False),
-        sa.Column("dimension",     sa.String(50),  nullable=False),
-        sa.Column("selected_option", sa.String(5), nullable=False),
-        sa.Column("option_label",  sa.Text(),      nullable=True),
-        sa.Column("score",         sa.Integer(),   nullable=False),
-        sa.Column("confidence",    sa.Float(),     nullable=False),
-        sa.Column("reason",        sa.Text(),      nullable=True),
-        sa.Column("sources",       sa.Text(),      nullable=True),
-        sa.Column("created_at",    sa.DateTime(),  server_default=sa.text("now()"), nullable=False),
-        sa.ForeignKeyConstraint(["assessment_id"], ["assessments.id"]),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("assessment_id", "dimension"),
-    )
+    # ── New nwc_dimension_scores table (CREATE IF NOT EXISTS) ──────────────────
+    from sqlalchemy import inspect
+    bind = op.get_bind()
+    if not inspect(bind).has_table("nwc_dimension_scores"):
+        op.create_table(
+            "nwc_dimension_scores",
+            sa.Column("id",            sa.Integer(),   nullable=False),
+            sa.Column("assessment_id", sa.Integer(),   nullable=False),
+            sa.Column("dimension",     sa.String(50),  nullable=False),
+            sa.Column("selected_option", sa.String(5), nullable=False),
+            sa.Column("option_label",  sa.Text(),      nullable=True),
+            sa.Column("score",         sa.Integer(),   nullable=False),
+            sa.Column("confidence",    sa.Float(),     nullable=False),
+            sa.Column("reason",        sa.Text(),      nullable=True),
+            sa.Column("sources",       sa.Text(),      nullable=True),
+            sa.Column("created_at",    sa.DateTime(),  server_default=sa.text("now()"), nullable=False),
+            sa.ForeignKeyConstraint(["assessment_id"], ["assessments.id"]),
+            sa.PrimaryKeyConstraint("id"),
+            sa.UniqueConstraint("assessment_id", "dimension"),
+        )
 
 
 def downgrade() -> None:
